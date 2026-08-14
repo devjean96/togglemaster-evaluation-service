@@ -20,7 +20,7 @@ var ctx = context.Background()
 // App struct para injeção de dependência
 type App struct {
 	RedisClient         *redis.Client
-	SqsSvc              *sqs.SQS
+	SqsSvc              SQSClient
 	SqsQueueURL         string
 	HttpClient          *http.Client
 	FlagServiceURL      string

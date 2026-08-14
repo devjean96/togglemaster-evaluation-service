@@ -71,6 +71,19 @@ Ele funciona da seguinte forma:
     ```
     O servidor estará rodando em `http://localhost:8004`.
 
+## ✅ Qualidade e testes
+
+```bash
+gofmt -w .
+go vet ./...
+go test -race -cover ./...
+go build -o bin/evaluation-service .
+docker build -t togglemaster-evaluation-service .
+```
+
+O workflow `.github/workflows/ci.yml` executa formatação, análise estática, testes
+unitários e build do binário antes de validar a imagem Docker.
+
 ## 🧪 Testando os Endpoints
 
 Para os testes, vamos assumir que você já criou:
@@ -100,4 +113,3 @@ Saída (exemplo): `{"flag_name":"enable-new-dashboard","user_id":"user-abc","res
 **3. Verifique o Cache:** Execute o mesmo comando duas vezes seguidas. Na segunda vez, você verá um log "Cache HIT" no terminal do `evaluation-service`.
 
 **4. Verifique a Fila SQS:** Após fazer as chamadas acima, vá até o console da AWS, abra sua fila SQS e verifique se as mensagens (`EvaluationEvent`) estão chegando.
-

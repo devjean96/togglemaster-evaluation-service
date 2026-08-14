@@ -14,10 +14,10 @@ type Flag struct {
 
 // TargetingRule espelha a resposta do targeting-service
 type TargetingRule struct {
-	ID         int    `json:"id"`
-	FlagName   string `json:"flag_name"`
-	IsEnabled  bool   `json:"is_enabled"`
-	Rules      Rule   `json:"rules"` // O objeto JSONB
+	ID        int    `json:"id"`
+	FlagName  string `json:"flag_name"`
+	IsEnabled bool   `json:"is_enabled"`
+	Rules     Rule   `json:"rules"` // O objeto JSONB
 }
 
 // Rule é o objeto JSONB aninhado

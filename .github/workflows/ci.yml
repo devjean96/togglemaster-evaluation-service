@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Tests, lint and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+
+      - name: Run static analysis
+        run: go vet ./...
+
+      - name: Run unit tests
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Build application
+        run: go build -o bin/evaluation-service .
+
+  container:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: quality
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build application image
+        run: docker build --tag togglemaster-evaluation-service:${{ github.sha }} .

@@ -17,6 +17,11 @@ type EvaluationEvent struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+// SQSClient contém apenas a operação usada pela aplicação e facilita testes unitários.
+type SQSClient interface {
+	SendMessage(*sqs.SendMessageInput) (*sqs.SendMessageOutput, error)
+}
+
 // sendEvaluationEvent envia um evento para a fila SQS
 func (a *App) sendEvaluationEvent(userID, flagName string, result bool) {
 	// Se a URL da fila não foi configurada, apenas loga localmente e sai.
