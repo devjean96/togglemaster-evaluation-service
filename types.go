@@ -36,6 +36,7 @@ type CombinedFlagInfo struct {
 type NotFoundError struct {
 	FlagName string
 }
+
 func (e *NotFoundError) Error() string {
 	return fmt.Sprintf("flag ou regra '%s' não encontrada", e.FlagName)
 }
