@@ -30,11 +30,25 @@ func TestEvaluationHandlerRequiresParameters(t *testing.T) {
 	}
 }
 
+func TestEvaluationHandlerRejectsInvalidFlagName(t *testing.T) {
+	app := &App{}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/evaluate?user_id=user-1&flag_name=../admin", nil)
+
+	app.evaluationHandler(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestEvaluationHandlerReturnsCachedDecision(t *testing.T) {
 	app, server := newEvaluationApp(t, nil)
 	info := &CombinedFlagInfo{Flag: &Flag{Name: "checkout", IsEnabled: true}}
 	data, _ := json.Marshal(info)
-	server.Set("flag_info:checkout", string(data))
+	if err := server.Set("flag_info:checkout", string(data)); err != nil {
+		t.Fatalf("seeding cache: %v", err)
+	}
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/evaluate?user_id=user-1&flag_name=checkout", nil)
 

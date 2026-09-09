@@ -107,6 +107,82 @@ func TestRunEvaluationLogic(t *testing.T) {
 	}
 }
 
+func TestNewServiceRequestKeepsConfiguredOrigin(t *testing.T) {
+	t.Setenv("SERVICE_API_KEY", "service-key")
+
+	request, err := newServiceRequest("https://flag-service.example/api/", "flags", "checkout?#")
+	if err != nil {
+		t.Fatalf("creating service request: %v", err)
+	}
+	if request.URL.Scheme != "https" || request.URL.Host != "flag-service.example" {
+		t.Fatalf("unexpected request origin: %s", request.URL)
+	}
+	if request.URL.Path != "/api/flags/checkout?#" || request.URL.RawQuery != "" || request.URL.Fragment != "" {
+		t.Fatalf("flag name escaped the URL path: %s", request.URL)
+	}
+	if request.Header.Get("Authorization") != "Bearer service-key" {
+		t.Fatalf("unexpected authorization header: %s", request.Header.Get("Authorization"))
+	}
+}
+
+func TestNewServiceRequestRejectsInvalidFlagNames(t *testing.T) {
+	invalidNames := []string{
+		"",
+		".",
+		"..",
+		"path/segment",
+		`path\segment`,
+		"line\nbreak",
+		strings.Repeat("a", maxFlagNameLength+1),
+	}
+
+	for _, flagName := range invalidNames {
+		t.Run(flagName, func(t *testing.T) {
+			_, err := newServiceRequest("http://flag-service", "flags", flagName)
+			if !errors.Is(err, errInvalidFlagName) {
+				t.Fatalf("expected invalid flag name error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestNormalizeServiceBaseURLRejectsUnsafeURLs(t *testing.T) {
+	invalidURLs := []string{
+		"flag-service",
+		"ftp://flag-service",
+		"http://user:password@flag-service",
+		"http://flag-service?destination=internal",
+		"http://flag-service/#fragment",
+	}
+
+	for _, serviceURL := range invalidURLs {
+		t.Run(serviceURL, func(t *testing.T) {
+			if _, err := normalizeServiceBaseURL(serviceURL); err == nil {
+				t.Fatal("expected URL validation error")
+			}
+		})
+	}
+}
+
+func TestFetchFlagDoesNotFollowRedirects(t *testing.T) {
+	requests := 0
+	app, _ := newEvaluationApp(t, roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		if request.URL.Host != "flag-service" {
+			t.Fatalf("request escaped configured host: %s", request.URL)
+		}
+		response := jsonResponse(http.StatusFound, `{}`)
+		response.Header.Set("Location", "http://169.254.169.254/latest/meta-data/")
+		return response, nil
+	}))
+
+	_, err := app.fetchFlag("checkout")
+
+	if err == nil || requests != 1 {
+		t.Fatalf("expected one rejected redirect response, got %d requests and error %v", requests, err)
+	}
+}
+
 func TestFetchFlag(t *testing.T) {
 	t.Setenv("SERVICE_API_KEY", "service-key")
 	var authorization string
@@ -217,7 +293,9 @@ func TestGetCombinedFlagInfoUsesCache(t *testing.T) {
 	}))
 	cached := &CombinedFlagInfo{Flag: &Flag{Name: "checkout", IsEnabled: true}}
 	data, _ := json.Marshal(cached)
-	server.Set("flag_info:checkout", string(data))
+	if err := server.Set("flag_info:checkout", string(data)); err != nil {
+		t.Fatalf("seeding cache: %v", err)
+	}
 
 	info, err := app.getCombinedFlagInfo("checkout")
 
@@ -233,7 +311,9 @@ func TestGetCombinedFlagInfoFetchesAndCaches(t *testing.T) {
 		}
 		return jsonResponse(http.StatusNotFound, `{}`), nil
 	}))
-	server.Set("flag_info:checkout", "invalid-json")
+	if err := server.Set("flag_info:checkout", "invalid-json"); err != nil {
+		t.Fatalf("seeding cache: %v", err)
+	}
 
 	info, err := app.getCombinedFlagInfo("checkout")
 

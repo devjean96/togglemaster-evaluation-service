@@ -45,10 +45,18 @@ func main() {
 	if flagSvcURL == "" {
 		log.Fatal("FLAG_SERVICE_URL deve ser definida")
 	}
+	flagSvcURL, err := normalizeServiceBaseURL(flagSvcURL)
+	if err != nil {
+		log.Fatalf("FLAG_SERVICE_URL inválida: %v", err)
+	}
 
 	targetingSvcURL := os.Getenv("TARGETING_SERVICE_URL")
 	if targetingSvcURL == "" {
 		log.Fatal("TARGETING_SERVICE_URL deve ser definida")
+	}
+	targetingSvcURL, err = normalizeServiceBaseURL(targetingSvcURL)
+	if err != nil {
+		log.Fatalf("TARGETING_SERVICE_URL inválida: %v", err)
 	}
 
 	// SQS é opcional no dev local, mas obrigatório em prod
