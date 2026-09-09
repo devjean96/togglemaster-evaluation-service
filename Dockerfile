@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build stage: compiles a static Go binary and caches dependencies separately.
-FROM golang:1.21-alpine AS builder
+FROM golang:1.25.7-alpine AS builder
 
 WORKDIR /src
 
