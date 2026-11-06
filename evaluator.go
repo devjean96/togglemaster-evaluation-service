@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/json"
@@ -16,6 +17,12 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/go-redis/redis/v8"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -26,15 +33,30 @@ const (
 )
 
 var errInvalidFlagName = errors.New("nome da flag inválido")
+var evaluationTracer = otel.Tracer("togglemaster/evaluation-service")
 
 // getDecision é o wrapper principal
-func (a *App) getDecision(userID, flagName string) (bool, error) {
+func (a *App) getDecision(ctx context.Context, userID, flagName string) (result bool, err error) {
+	startedAt := time.Now()
+	ctx, span := evaluationTracer.Start(ctx, "feature_flag.evaluate")
+	defer func() {
+		span.SetAttributes(attribute.String("feature_flag.name", flagName))
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "evaluation failed")
+		} else {
+			span.SetAttributes(attribute.Bool("feature_flag.result", result))
+		}
+		a.recordEvaluation(ctx, result, time.Since(startedAt))
+		span.End()
+	}()
+
 	if err := validateFlagName(flagName); err != nil {
 		return false, err
 	}
 
 	// 1. Obter os dados da flag (do cache ou dos serviços)
-	info, err := a.getCombinedFlagInfo(flagName)
+	info, err := a.getCombinedFlagInfo(ctx, flagName)
 	if err != nil {
 		return false, err
 	}
@@ -44,16 +66,34 @@ func (a *App) getDecision(userID, flagName string) (bool, error) {
 }
 
 // getCombinedFlagInfo busca os dados no Redis, com fallback para os microsserviços
-func (a *App) getCombinedFlagInfo(flagName string) (*CombinedFlagInfo, error) {
+func (a *App) getCombinedFlagInfo(ctx context.Context, flagName string) (*CombinedFlagInfo, error) {
+	ctx, span := evaluationTracer.Start(ctx, "cache.feature_flag_configuration")
+	defer span.End()
 	cacheKey := fmt.Sprintf("flag_info:%s", flagName)
 
 	// 1. Tentar buscar do Cache (Redis)
-	val, err := a.RedisClient.Get(ctx, cacheKey).Result()
+	redisCtx, redisSpan := evaluationTracer.Start(
+		ctx,
+		"redis.get_feature_flag_configuration",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("db.system.name", "redis"),
+			attribute.String("db.operation.name", "GET"),
+		),
+	)
+	val, err := a.RedisClient.Get(redisCtx, cacheKey).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		redisSpan.RecordError(err)
+		redisSpan.SetStatus(codes.Error, "redis GET failed")
+	}
+	redisSpan.End()
 	if err == nil {
 		// Cache HIT
 		var info CombinedFlagInfo
 		if unmarshalErr := json.Unmarshal([]byte(val), &info); unmarshalErr == nil {
 			log.Printf("Cache HIT para flag '%s'", flagName)
+			span.SetAttributes(attribute.Bool("cache.hit", true))
+			a.recordCacheAccess(ctx, true)
 			return &info, nil
 		} else {
 			// Se o unmarshal falhar, trata como cache miss
@@ -62,8 +102,10 @@ func (a *App) getCombinedFlagInfo(flagName string) (*CombinedFlagInfo, error) {
 	}
 
 	log.Printf("Cache MISS para flag '%s'", flagName)
+	span.SetAttributes(attribute.Bool("cache.hit", false))
+	a.recordCacheAccess(ctx, false)
 	// 2. Cache MISS - Buscar dos serviços
-	info, err := a.fetchFromServices(flagName)
+	info, err := a.fetchFromServices(ctx, flagName)
 	if err != nil {
 		return nil, err
 	}
@@ -71,16 +113,28 @@ func (a *App) getCombinedFlagInfo(flagName string) (*CombinedFlagInfo, error) {
 	// 3. Salvar no Cache
 	jsonData, err := json.Marshal(info)
 	if err == nil {
-		if err := a.RedisClient.Set(ctx, cacheKey, jsonData, CACHE_TTL).Err(); err != nil {
+		redisCtx, redisSpan := evaluationTracer.Start(
+			ctx,
+			"redis.set_feature_flag_configuration",
+			trace.WithSpanKind(trace.SpanKindClient),
+			trace.WithAttributes(
+				attribute.String("db.system.name", "redis"),
+				attribute.String("db.operation.name", "SET"),
+			),
+		)
+		if err := a.RedisClient.Set(redisCtx, cacheKey, jsonData, CACHE_TTL).Err(); err != nil {
+			redisSpan.RecordError(err)
+			redisSpan.SetStatus(codes.Error, "redis SET failed")
 			log.Printf("Erro ao salvar flag '%s' no cache: %v", flagName, err)
 		}
+		redisSpan.End()
 	}
 
 	return info, nil
 }
 
 // fetchFromServices busca dados do flag-service e targeting-service concorrentemente
-func (a *App) fetchFromServices(flagName string) (*CombinedFlagInfo, error) {
+func (a *App) fetchFromServices(ctx context.Context, flagName string) (*CombinedFlagInfo, error) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -91,13 +145,13 @@ func (a *App) fetchFromServices(flagName string) (*CombinedFlagInfo, error) {
 	// Goroutine 1: Buscar do flag-service
 	go func() {
 		defer wg.Done()
-		flagInfo, flagErr = a.fetchFlag(flagName)
+		flagInfo, flagErr = a.fetchFlag(ctx, flagName)
 	}()
 
 	// Goroutine 2: Buscar do targeting-service
 	go func() {
 		defer wg.Done()
-		ruleInfo, ruleErr = a.fetchRule(flagName)
+		ruleInfo, ruleErr = a.fetchRule(ctx, flagName)
 	}()
 
 	wg.Wait()
@@ -147,7 +201,7 @@ func normalizeServiceBaseURL(rawURL string) (string, error) {
 	return baseURL.String(), nil
 }
 
-func newServiceRequest(baseURL, resource, flagName string) (*http.Request, error) {
+func newServiceRequest(ctx context.Context, baseURL, resource, flagName string) (*http.Request, error) {
 	if err := validateFlagName(flagName); err != nil {
 		return nil, err
 	}
@@ -163,7 +217,7 @@ func newServiceRequest(baseURL, resource, flagName string) (*http.Request, error
 	endpoint.Path += "/" + resource + "/" + flagName
 
 	// #nosec G704 -- o esquema e o host vêm da URL-base validada; a entrada do cliente é apenas um segmento de caminho validado.
-	request, err := http.NewRequest(http.MethodGet, endpoint.String(), http.NoBody)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), http.NoBody)
 	if err != nil {
 		return nil, fmt.Errorf("erro ao criar requisição para o serviço: %w", err)
 	}
@@ -194,14 +248,15 @@ func closeResponseBody(body io.Closer) {
 }
 
 // fetchFlag (função helper)
-func (a *App) fetchFlag(flagName string) (*Flag, error) {
-	req, err := newServiceRequest(a.FlagServiceURL, "flags", flagName)
+func (a *App) fetchFlag(ctx context.Context, flagName string) (*Flag, error) {
+	req, err := newServiceRequest(ctx, a.FlagServiceURL, "flags", flagName)
 	if err != nil {
 		return nil, fmt.Errorf("erro ao preparar chamada ao flag-service: %w", err)
 	}
 
 	resp, err := a.doServiceRequest(req)
 	if err != nil {
+		a.recordDependencyError(ctx, "flag-service")
 		return nil, fmt.Errorf("erro ao chamar flag-service: %w", err)
 	}
 	defer closeResponseBody(resp.Body)
@@ -210,6 +265,7 @@ func (a *App) fetchFlag(flagName string) (*Flag, error) {
 		return nil, &NotFoundError{flagName}
 	}
 	if resp.StatusCode != http.StatusOK {
+		a.recordDependencyError(ctx, "flag-service")
 		return nil, fmt.Errorf("flag-service retornou status %d", resp.StatusCode)
 	}
 
@@ -220,14 +276,15 @@ func (a *App) fetchFlag(flagName string) (*Flag, error) {
 	return &flag, nil
 }
 
-func (a *App) fetchRule(flagName string) (*TargetingRule, error) {
-	req, err := newServiceRequest(a.TargetingServiceURL, "rules", flagName)
+func (a *App) fetchRule(ctx context.Context, flagName string) (*TargetingRule, error) {
+	req, err := newServiceRequest(ctx, a.TargetingServiceURL, "rules", flagName)
 	if err != nil {
 		return nil, fmt.Errorf("erro ao preparar chamada ao targeting-service: %w", err)
 	}
 
 	resp, err := a.doServiceRequest(req)
 	if err != nil {
+		a.recordDependencyError(ctx, "targeting-service")
 		return nil, fmt.Errorf("erro ao chamar targeting-service: %w", err)
 	}
 	defer closeResponseBody(resp.Body)
@@ -236,6 +293,7 @@ func (a *App) fetchRule(flagName string) (*TargetingRule, error) {
 		return nil, &NotFoundError{flagName} // Não é um erro fatal
 	}
 	if resp.StatusCode != http.StatusOK {
+		a.recordDependencyError(ctx, "targeting-service")
 		return nil, fmt.Errorf("targeting-service retornou status %d", resp.StatusCode)
 	}
 

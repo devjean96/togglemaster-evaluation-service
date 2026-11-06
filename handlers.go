@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -34,7 +35,7 @@ func (a *App) evaluationHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. Obter a decisão (lógica de cache/serviço está em evaluator.go)
-	result, err := a.getDecision(userID, flagName)
+	result, err := a.getDecision(r.Context(), userID, flagName)
 	if err != nil {
 		if errors.Is(err, errInvalidFlagName) {
 			http.Error(w, `{"error": "flag_name inválido"}`, http.StatusBadRequest)
@@ -54,7 +55,8 @@ func (a *App) evaluationHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 3. Enviar evento para SQS (assincronamente)
 	// Isso não bloqueia a resposta para o cliente.
-	go a.sendEvaluationEvent(userID, flagName, result)
+	publishCtx := context.WithoutCancel(r.Context())
+	go a.sendEvaluationEvent(publishCtx, userID, flagName, result)
 
 	// 4. Retornar a resposta
 	w.WriteHeader(http.StatusOK)

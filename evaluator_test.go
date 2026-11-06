@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +11,10 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/go-redis/redis/v8"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -110,7 +115,7 @@ func TestRunEvaluationLogic(t *testing.T) {
 func TestNewServiceRequestKeepsConfiguredOrigin(t *testing.T) {
 	t.Setenv("SERVICE_API_KEY", "service-key")
 
-	request, err := newServiceRequest("https://flag-service.example/api/", "flags", "checkout?#")
+	request, err := newServiceRequest(context.Background(), "https://flag-service.example/api/", "flags", "checkout?#")
 	if err != nil {
 		t.Fatalf("creating service request: %v", err)
 	}
@@ -138,7 +143,7 @@ func TestNewServiceRequestRejectsInvalidFlagNames(t *testing.T) {
 
 	for _, flagName := range invalidNames {
 		t.Run(flagName, func(t *testing.T) {
-			_, err := newServiceRequest("http://flag-service", "flags", flagName)
+			_, err := newServiceRequest(context.Background(), "http://flag-service", "flags", flagName)
 			if !errors.Is(err, errInvalidFlagName) {
 				t.Fatalf("expected invalid flag name error, got %v", err)
 			}
@@ -176,7 +181,7 @@ func TestFetchFlagDoesNotFollowRedirects(t *testing.T) {
 		return response, nil
 	}))
 
-	_, err := app.fetchFlag("checkout")
+	_, err := app.fetchFlag(context.Background(), "checkout")
 
 	if err == nil || requests != 1 {
 		t.Fatalf("expected one rejected redirect response, got %d requests and error %v", requests, err)
@@ -191,13 +196,39 @@ func TestFetchFlag(t *testing.T) {
 		return jsonResponse(http.StatusOK, `{"id":1,"name":"checkout","is_enabled":true}`), nil
 	}))
 
-	flag, err := app.fetchFlag("checkout")
+	flag, err := app.fetchFlag(context.Background(), "checkout")
 
 	if err != nil || flag.Name != "checkout" || !flag.IsEnabled {
 		t.Fatalf("unexpected flag result: %+v, %v", flag, err)
 	}
 	if authorization != "Bearer service-key" {
 		t.Fatalf("unexpected authorization header: %s", authorization)
+	}
+}
+
+func TestInstrumentedHTTPClientPropagatesTraceContext(t *testing.T) {
+	previousPropagator := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() { otel.SetTextMapPropagator(previousPropagator) })
+
+	var traceparent string
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		traceparent = request.Header.Get("traceparent")
+		return jsonResponse(http.StatusOK, `{"name":"checkout","is_enabled":true}`), nil
+	})
+	app, _ := newEvaluationApp(t, otelhttp.NewTransport(transport))
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.AlwaysSample()))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	ctx, span := provider.Tracer("test/evaluation").Start(context.Background(), "parent")
+
+	_, err := app.fetchFlag(ctx, "checkout")
+	span.End()
+
+	if err != nil {
+		t.Fatalf("fetching flag: %v", err)
+	}
+	if traceparent == "" {
+		t.Fatal("expected traceparent on outbound request")
 	}
 }
 
@@ -224,7 +255,7 @@ func TestFetchFlagErrors(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			app, _ := newEvaluationApp(t, test.transport)
-			_, err := app.fetchFlag("checkout")
+			_, err := app.fetchFlag(context.Background(), "checkout")
 			if err == nil {
 				t.Fatal("expected an error")
 			}
@@ -244,7 +275,7 @@ func TestFetchRule(t *testing.T) {
 		), nil
 	}))
 
-	rule, err := app.fetchRule("checkout")
+	rule, err := app.fetchRule(context.Background(), "checkout")
 
 	if err != nil || rule.FlagName != "checkout" || rule.Rules.Value.(float64) != 50 {
 		t.Fatalf("unexpected rule result: %+v, %v", rule, err)
@@ -274,7 +305,7 @@ func TestFetchRuleErrors(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			app, _ := newEvaluationApp(t, test.transport)
-			_, err := app.fetchRule("checkout")
+			_, err := app.fetchRule(context.Background(), "checkout")
 			if err == nil {
 				t.Fatal("expected an error")
 			}
@@ -297,7 +328,7 @@ func TestGetCombinedFlagInfoUsesCache(t *testing.T) {
 		t.Fatalf("seeding cache: %v", err)
 	}
 
-	info, err := app.getCombinedFlagInfo("checkout")
+	info, err := app.getCombinedFlagInfo(context.Background(), "checkout")
 
 	if err != nil || info.Flag.Name != "checkout" {
 		t.Fatalf("unexpected cached result: %+v, %v", info, err)
@@ -315,7 +346,7 @@ func TestGetCombinedFlagInfoFetchesAndCaches(t *testing.T) {
 		t.Fatalf("seeding cache: %v", err)
 	}
 
-	info, err := app.getCombinedFlagInfo("checkout")
+	info, err := app.getCombinedFlagInfo(context.Background(), "checkout")
 
 	if err != nil || info.Flag.Name != "checkout" || info.Rule != nil {
 		t.Fatalf("unexpected service result: %+v, %v", info, err)
@@ -333,7 +364,7 @@ func TestGetDecisionReturnsFlagServiceError(t *testing.T) {
 		return jsonResponse(http.StatusNotFound, `{}`), nil
 	}))
 
-	if _, err := app.getDecision("user-1", "checkout"); err == nil {
+	if _, err := app.getDecision(context.Background(), "user-1", "checkout"); err == nil {
 		t.Fatal("expected flag-service error")
 	}
 }

@@ -114,3 +114,14 @@ Saída (exemplo): `{"flag_name":"enable-new-dashboard","user_id":"user-abc","res
 
 **4. Verifique a Fila SQS:** Após fazer as chamadas acima, vá até o console da AWS, abra sua fila SQS e verifique se as mensagens (`EvaluationEvent`) estão chegando.
 
+## OpenTelemetry e New Relic APM
+
+O serviço instrumenta o servidor e os clientes HTTP, a avaliação, o cache Redis
+e a publicação SQS. O `context.Context` da requisição é propagado às chamadas
+concorrentes de flag e targeting. O envio assíncrono preserva o SpanContext e
+grava `traceparent`/`tracestate` nos `MessageAttributes` do SQS.
+
+As métricas cobrem avaliações, duração, cache hit/miss, falhas de dependências e
+falhas de publicação. O identificador do usuário não é incluído em atributos de
+span ou métricas.
+

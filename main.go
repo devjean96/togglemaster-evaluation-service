@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -12,10 +16,8 @@ import (
 	"github.com/aws/aws-sdk-go/service/sqs"
 	"github.com/go-redis/redis/v8"
 	"github.com/joho/godotenv"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
-
-// Contexto global para o Redis
-var ctx = context.Background()
 
 // App struct para injeção de dependência
 type App struct {
@@ -25,10 +27,31 @@ type App struct {
 	HttpClient          *http.Client
 	FlagServiceURL      string
 	TargetingServiceURL string
+	Metrics             *AppMetrics
 }
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	_ = godotenv.Load() // Carrega .env para dev local
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	shutdownTelemetry, err := setupTelemetry(ctx)
+	if err != nil {
+		return fmt.Errorf("inicializar OpenTelemetry: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := shutdownTelemetry(shutdownCtx); err != nil {
+			log.Printf("Erro ao encerrar OpenTelemetry: %v", err)
+		}
+	}()
 
 	// --- Configuração ---
 	port := os.Getenv("PORT")
@@ -38,25 +61,25 @@ func main() {
 
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL == "" {
-		log.Fatal("REDIS_URL deve ser definida (ex: redis://localhost:6379)")
+		return errors.New("REDIS_URL deve ser definida (ex: redis://localhost:6379)")
 	}
 
 	flagSvcURL := os.Getenv("FLAG_SERVICE_URL")
 	if flagSvcURL == "" {
-		log.Fatal("FLAG_SERVICE_URL deve ser definida")
+		return errors.New("FLAG_SERVICE_URL deve ser definida")
 	}
-	flagSvcURL, err := normalizeServiceBaseURL(flagSvcURL)
+	flagSvcURL, err = normalizeServiceBaseURL(flagSvcURL)
 	if err != nil {
-		log.Fatalf("FLAG_SERVICE_URL inválida: %v", err)
+		return fmt.Errorf("FLAG_SERVICE_URL inválida: %w", err)
 	}
 
 	targetingSvcURL := os.Getenv("TARGETING_SERVICE_URL")
 	if targetingSvcURL == "" {
-		log.Fatal("TARGETING_SERVICE_URL deve ser definida")
+		return errors.New("TARGETING_SERVICE_URL deve ser definida")
 	}
 	targetingSvcURL, err = normalizeServiceBaseURL(targetingSvcURL)
 	if err != nil {
-		log.Fatalf("TARGETING_SERVICE_URL inválida: %v", err)
+		return fmt.Errorf("TARGETING_SERVICE_URL inválida: %w", err)
 	}
 
 	// SQS é opcional no dev local, mas obrigatório em prod
@@ -67,7 +90,7 @@ func main() {
 		log.Println("Atenção: AWS_SQS_URL não definida. Eventos não serão enviados.")
 	}
 	if awsRegion == "" && sqsQueueURL != "" {
-		log.Fatal("AWS_REGION deve ser definida para usar SQS")
+		return errors.New("AWS_REGION deve ser definida para usar SQS")
 	}
 
 	// --- Inicializa Clientes ---
@@ -75,11 +98,16 @@ func main() {
 	// Cliente Redis
 	opt, err := redis.ParseURL(redisURL)
 	if err != nil {
-		log.Fatalf("Não foi possível parsear a URL do Redis: %v", err)
+		return fmt.Errorf("não foi possível parsear a URL do Redis: %w", err)
 	}
 	rdb := redis.NewClient(opt)
+	defer func() {
+		if err := rdb.Close(); err != nil {
+			log.Printf("Erro ao fechar Redis: %v", err)
+		}
+	}()
 	if _, err := rdb.Ping(ctx).Result(); err != nil {
-		log.Fatalf("Não foi possível conectar ao Redis: %v", err)
+		return fmt.Errorf("não foi possível conectar ao Redis: %w", err)
 	}
 	log.Println("Conectado ao Redis com sucesso!")
 
@@ -92,7 +120,7 @@ func main() {
 		}
 		sess, err := session.NewSession(awsConfig)
 		if err != nil {
-			log.Fatalf("Não foi possível criar sessão AWS: %v", err)
+			return fmt.Errorf("não foi possível criar sessão AWS: %w", err)
 		}
 		sqsSvc = sqs.New(sess)
 		log.Println("Cliente SQS inicializado com sucesso.")
@@ -100,7 +128,8 @@ func main() {
 
 	// Cliente HTTP (com timeout)
 	httpClient := &http.Client{
-		Timeout: 5 * time.Second,
+		Timeout:   5 * time.Second,
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
 	}
 
 	// Cria a instância da App
@@ -111,15 +140,37 @@ func main() {
 		HttpClient:          httpClient,
 		FlagServiceURL:      flagSvcURL,
 		TargetingServiceURL: targetingSvcURL,
+		Metrics:             newAppMetrics(),
 	}
 
 	// --- Rotas ---
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", app.healthHandler)
-	mux.HandleFunc("/evaluate", app.evaluationHandler)
+	mux.Handle("/evaluate", otelhttp.NewHandler(http.HandlerFunc(app.evaluationHandler), "GET /evaluate"))
 
 	log.Printf("Serviço de Avaliação (Go) rodando na porta %s", port)
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
-		log.Fatal(err)
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
+	serverErrors := make(chan error, 1)
+	go func() {
+		serverErrors <- server.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serverErrors:
+		if !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("servidor HTTP: %w", err)
+		}
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("encerrar servidor HTTP: %w", err)
+		}
+	}
+
+	return nil
 }
