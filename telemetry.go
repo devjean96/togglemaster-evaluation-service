@@ -33,10 +33,7 @@ func setupTelemetry(ctx context.Context) (func(context.Context) error, error) {
 	if serviceName == "" {
 		serviceName = "evaluation-service"
 	}
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName(serviceName)),
-	)
+	res, err := telemetryResource(serviceName)
 	if err != nil {
 		return nil, err
 	}
@@ -71,6 +68,16 @@ func setupTelemetry(ctx context.Context) (func(context.Context) error, error) {
 	return func(shutdownCtx context.Context) error {
 		return errors.Join(meterProvider.Shutdown(shutdownCtx), tracerProvider.Shutdown(shutdownCtx))
 	}, nil
+}
+
+func telemetryResource(serviceName string) (*resource.Resource, error) {
+	// resource.Default uses the schema version bundled with the OTel SDK. The
+	// service name is schemaless so it can be merged without conflicting with
+	// that version when the semconv dependency and SDK evolve independently.
+	return resource.Merge(
+		resource.Default(),
+		resource.NewSchemaless(semconv.ServiceName(serviceName)),
+	)
 }
 
 func samplerFromEnv() trace.Sampler {
