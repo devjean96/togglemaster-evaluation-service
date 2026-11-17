@@ -20,6 +20,10 @@ env:
   AWS_REGION: us-east-1
   ECR_REGISTRY: 434271199872.dkr.ecr.us-east-1.amazonaws.com
   ECR_REPOSITORY: togglemaster-homolog/evaluation-service
+  EKS_CLUSTER_NAME: togglemaster-homolog-eks
+  KUBERNETES_NAMESPACE: togglemaster-homolog
+  AWS_CREDENTIALS_SECRET: aws-academy-credentials
+  AWS_CREDENTIAL_DEPLOYMENTS: analytics-service evaluation-service
   GITOPS_REPOSITORY: devjean96/togglemaster-gitops
 
 jobs:
@@ -172,12 +176,72 @@ jobs:
           docker push "$remote_image"
           echo "Published $remote_image" >> "$GITHUB_STEP_SUMMARY"
 
+  refresh-academy-credentials:
+    name: Refresh AWS Academy credentials in EKS
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: container
+
+    steps:
+      - name: Configure AWS Academy credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Configure access to the EKS cluster
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Create or update shared AWS credentials
+        env:
+          ACADEMY_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          ACADEMY_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          ACADEMY_AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for variable in \
+            ACADEMY_AWS_ACCESS_KEY_ID \
+            ACADEMY_AWS_SECRET_ACCESS_KEY \
+            ACADEMY_AWS_SESSION_TOKEN; do
+            if [[ -z "${!variable:-}" ]]; then
+              echo "::error::$variable is required to update the Kubernetes Secret."
+              exit 1
+            fi
+          done
+
+          kubectl --namespace "$KUBERNETES_NAMESPACE" create secret generic "$AWS_CREDENTIALS_SECRET" \
+            --from-literal=AWS_ACCESS_KEY_ID="$ACADEMY_AWS_ACCESS_KEY_ID" \
+            --from-literal=AWS_SECRET_ACCESS_KEY="$ACADEMY_AWS_SECRET_ACCESS_KEY" \
+            --from-literal=AWS_SESSION_TOKEN="$ACADEMY_AWS_SESSION_TOKEN" \
+            --dry-run=client \
+            --output=yaml \
+            | kubectl apply --filename=-
+
+      - name: Restart AWS credential consumers
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          read -ra deployments <<< "$AWS_CREDENTIAL_DEPLOYMENTS"
+          for deployment in "${deployments[@]}"; do
+            kubectl --namespace "$KUBERNETES_NAMESPACE" rollout restart "deployment/$deployment"
+            kubectl --namespace "$KUBERNETES_NAMESPACE" rollout status "deployment/$deployment" --timeout=5m
+          done
+
   update-gitops:
     name: Update GitOps image tag
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: container
+    needs:
+      - container
+      - refresh-academy-credentials
 
     steps:
       - name: Checkout GitOps repository
